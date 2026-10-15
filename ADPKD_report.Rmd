@@ -1,0 +1,495 @@
+---
+title: "ADPKD Report"
+author: "Lena Mandrik"
+date: "13/08/2026"
+output:
+  word_document: default
+  pdf_document: default
+contact: o.mandrik@sheffield.ac.uk
+---
+
+# 1.	Model structure
+The microsimulation hybrid model consists of two components: the natural history of the disease and the diagnostic pathway. The sampling logic of the model is illustrated in Figure 1. 
+
+![Figure 1. Sampling logic for the ADPKD model](Reports/Fig1.png)
+The model is run through the main script that defines the main variable input parameters, such as the size for the index case population, type of analysis to run (deterministic or probabilistic sensitivity analysis - PSA), and the number of the PSA runs if selected.
+
+```{r}
+rm(list = ls(all = TRUE)) # Remove everything in the workspace 
+
+# Optional: user library path on Windows (edit or remove if not needed)
+#user_lib <- file.path(Sys.getenv("LOCALAPPDATA"), "R", "win-library", "4.6")
+#.libPaths(c(user_lib, .Library))
+#Load libraries
+library("utils")
+library("usethis")
+library("mvtnorm")
+library("truncnorm")
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+
+# Define basic model parameters
+run_mode <- "Deterministic" # PSA or Deterministic or Testing (returns all intermediary matrices)
+p.set <- 1 # parameter set 1 = mean values
+N.index <- 100000
+d.c <- 0.035
+d.e <- 0.035
+
+# Horizon of the model in years
+t.horizon <- 101 #18 is the earliest age in the model, 100 is assumed the maximum life expectancy (Need +1 for the 0 cycle start)
+
+# Decision threshold
+lambda <- 20000
+N.sets <- 1000 #1 for DA, N of PSA loops for PSA
+
+# Tolvaptan stopping rule:
+#   1 - suggested (stop at eGFR <= 15; basecase)
+#   2 - trial-based probabilistic discontinuation only, not linked to eGFR)
+#   3 - both rules together
+Tolv_stop <- 1
+
+#set seed
+seed = 2024
+
+# Load functions and data, and generate parameter set 1 (mean values).
+# This is used for the population description and the deterministic analysis.
+# In PSA mode, the parameters and population are saved once in the chunk
+# "psa_setup"; the PSA runs themselves are run in parallel on the HPC (run_PSA.sh).
+source("Main_model.R")
+```
+
+
+## 1.1. Characteristics of the Population
+
+The population includes both index cases and their relatives, with the following characteristics:
+
+- **Index cases**: Characteristics include sex, age, mutation type, estimated glomerular filtration rate (eGFR) values, chronic kidney disease (CKD) stage, age of high blood pressure (BP), age of the first urological event, and quality of life values (utilities). Additionally, index cases are characterized by the number of siblings and the number of offspring.
+
+- **Relatives**: Characteristics include the reference number of the associated index case and their relationship status (i.e., "sibling" or "offspring").
+
+All variables are updated annually.
+
+### 1.1.1. Characteristics of the Index Cases
+After loading the scripts, the model reconstructs the population of the index cases. Each index case has the following characteristics sampled:
+- **Sex**: Binary, determined by the proportion of males in the population ([p.ind_M]), based on Wong et al. (2024).
+- **Mutation type**: Categorical, with subtypes PKD1_PT, PKD1_NT, PKD2, or other mutations, based on probabilities reported by Elhassan et al. (2024).
+- **Age at diagnosis**: Continuous, sampled from a truncated normal distribution reported by Elhassan et al. (2024).
+- **eGFR value at diagnosis**: Continuous, sex-specific, and sampled from a lognormal distribution, based on Wong et al. (2024). The highest eGFR values were truncated to 130ml/min/m2.
+- **CKD stage**: Determined based on eGFR values for each patient, following the existing staging system ([UK CKD Staging System](https://ukkidney.org/health-professionals/information-resources/uk-eckd-guide/ckd-staging)).
+- **Age of high blood pressure (BP)**: Continuous, informed by mutation subtypes, as reported by Elhassan et al. (2024).
+- **Age of the first urological event**: Continuous, informed by mutation subtypes, as reported by Elhassan et al. (2024).
+- **Utilities**: Continuous, based on eGFR/CKD stage, age, and sex.
+- **Number of siblings**: Categorical, with values ranging from 0 to 8. Inputs are informed by the Understanding Society dataset (Main Survey, wave 13, `m_indresp` file), available from the UK Data Service. Categories with more than 7 siblings were converted to 8.
+- **Number of offspring**: Categorical, with values ranging from 0 to 4. Inputs are informed by the Understanding Society dataset (Main Survey, wave 13, merging the files `m_indresp` and `xhhrel`), available from the UK Data Service. Categories with more than 2 offspring were converted to 3.
+
+
+```{r}
+source('R files/pop.i.R')
+
+# characteristics of the sampled population
+# Proportion of people with diagnosed hypertension before diagnosis
+print(paste("Proportion of people with diagnosed hypertension before diagnosis is", (sum(m.pop.index[,"Age_diag"]>=m.pop.index[,"High_BP"])/nrow(m.pop.index))))
+ #Aim 60-70%. Is 60%
+
+# Proportion of people with diagnosed urological event before diagnosis
+print(paste("Proportion of people with diagnosed urological event before diagnosis is", (sum(m.pop.index[,"Age_diag"]>=m.pop.index[,"Urol_event"])/nrow(m.pop.index)))) #Aim 60-70%. Is 67%
+
+  # Proportion of people with diagnosed hypertension before age 35 years
+print(paste("Proportion of people with diagnosed hypertension before age 35 years is", (sum(35>=m.pop.index[,"High_BP"])/nrow(m.pop.index)))) # Target 45%, Is 52%
+
+# Proportion of people with diagnosed urological event before age 35 years
+#
+print(paste("Proportion of people with diagnosed urological event before age 35 years is", (sum(35>=m.pop.index[,"Urol_event"])/nrow(m.pop.index)))) # Target 44%, is 57%
+
+# Distribution for age at diagnosis
+hist(m.pop.index[,"Age_diag"], main = "Index Case: Age at Diagnosis Distribution", xlab = "Age at diagnosis, years", breaks = 30, xlim = c(0, 100))
+
+# Hypertension and urological events: only people who have the event (999 = no event)
+BP  <- m.pop.index[,"High_BP"]
+Uro <- m.pop.index[,"Urol_event"]
+hist(BP[BP < 999],   main = "Index Case: BP Age Distribution", xlab = "Hypertension Age, years", breaks = 30, xlim = c(0, 100))
+hist(Uro[Uro < 999], main = "Index Case: Urological Event Distribution", xlab = "Age of the first urological event, years", breaks = 30, xlim = c(0, 100))
+
+```
+
+
+### 1.1.2. Characteristics of the Population of Relatives
+
+- **Index Case Number**: Continuous, sequential identifier for each index case in the dataset of index cases (`m.pop.rel`).
+- **Relation Status**: Categorical, with:
+  - 1 representing siblings
+  - 2 representing offspring
+- **Age**: Continuous, calculated as the age difference between male or female index cases and their offspring or siblings. This parameter was informed by data from the Office for National Statistics (2024), which reports births by parental characteristics, such as the standardized age of mothers (by birth order) and fathers.
+  - For female index cases, the mean age at diagnosis was 36.5 years. Data from 2017 was used to extract the mean age at birth for mothers. The age difference for the first to fourth child was used to calculate the standard deviation for a normal distribution for this parameter. The mean age difference between female index cases and their siblings was 30.5 years (s.d. = 1.79). 
+  - For male index cases, the same approach to evlauation of parameters for normal distribution was applied. The mean age difference was 33.3 years (s.d. = 1.79).
+  - Sibling data from 1988 were used to estimate age differences. Since the National Statistics (2024) reports the age at birth only for the first four children, but the index case may have up to eight siblings, the age differences between an index case and 5th to 8th siblings were calculated using the mean difference for extrapolation. These extrapolated values were used to calculate the standard deviation of the mean age difference across siblings, resulting in a mean of 1.4 years (s.d. = 4.15).
+- **Sex**: Randomly allocated, assuming a 50% probability of being male or female for each relative.
+- **Mutation**: Relatives inherit the mutation present in the index case with a 50% probability.
+- **eGFR values**: For relatives with genetic mutation, eGFR is sampled. It was considered that eGFR are dependent on age and sex, as it is reported by van den Brand et al (2011). Considering no UK-based evidence on eGFR value on not clinically diagnosed (i.e. healthy) population, the regression models were fitted to eGFR distribution data by age and sex reported in this study.
+- **CKD stage**: Determined based on eGFR values for each relative, following the existing staging system ([UK CKD Staging System](https://ukkidney.org/health-professionals/information-resources/uk-eckd-guide/ckd-staging)). For people with genetic mutation, CKD stage 1 was assigned if they have eGFR level of 90 or above. For people without genetic mutation, CKD stage 0 was assigned if they have eGFR level 90 or above. For those individuals with the eGFR level less than 90, the relevant CKD stage was assigned independently on their genetic mutation status.
+- **Age of high blood pressure (BP)**: Continuous variable. For relatives who inherited genetic mutation, it is informed similar to the index cases by Elhassan et al. (2024).The age distribution of hyperension among individuals without genetic mutation was sampled from lognormal distribution using data on age at enrollment and median duration of hypertension in years from the cross-sectional population based UK study of Tapela et al (2021).
+- **Age of the first urological event**: Continuous variable. For relatives who inherited genetic mutation, it is informed similar to the index cases by Elhassan et al. (2024). For relatives who inherited genetic mutation, it was assumed that they did not have any urological events in the past.
+
+
+```{r}
+source('R files/pop.r.R')
+
+
+# characteristics of the sampled population
+print(paste("Proportion of people with diagnosed hypertension before genetic testing is", round(sum(m.pop.rel[,"Age_0"]>=m.pop.rel[,"High_BP"])/nrow(m.pop.rel),2)))
+
+print(paste("Proportion of people with diagnosed urological event before genetic testing is", round(sum(m.pop.rel[,"Age_0"]>=m.pop.rel[,"Urol_event"])/nrow(m.pop.rel),2)))
+
+print(paste("Proportion of people with diagnosed hypertension before age 35 years is", 
+           round(sum(35 >= m.pop.rel[,"High_BP"])/nrow(m.pop.rel),2))) #45% - target for index cases. Should be less in relatives
+
+print(paste("Proportion of people with diagnosed urological event before age 35 years is", 
+            round(sum(35 >= m.pop.rel[,"Urol_event"])/nrow(m.pop.rel),2))) # target 44% for index cases. Should be less in relatives
+
+# distribution for age at diagnosis
+child = m.pop.rel[m.pop.rel[,"Relation_status"]==2, ]
+sibling = m.pop.rel[m.pop.rel[,"Relation_status"]==1, ]
+
+min(child[,"Age_0"])
+max(child[,"Age_0"])
+
+min(sibling[,"Age_0"])
+max(sibling[,"Age_0"])
+
+# Histogram of ages below 100 only: drops the "no event" codes
+# (999 for carriers; Urol_event = 100 for relatives without the mutation)
+f.hist.age <- function(x, main, xlab) {
+  hist(x[x < 100], main = main, xlab = xlab, breaks = 30, xlim = c(0, 100))
+}
+
+f.hist.age(child[,"Age_0"],      "Child: Age at Time of Diagnosis of Index Cases Distribution", "Age of relatives, years")
+f.hist.age(child[,"High_BP"],    "Child: BP Age Distribution", "Hypertension Age, years")
+f.hist.age(child[,"Urol_event"], "Child: Urological Event Distribution", "Age of the first urological event, years")
+
+f.hist.age(sibling[,"Age_0"],      "Sibling: Age at Time of Diagnosis of Index Cases Distribution", "Age of relatives, years")
+f.hist.age(sibling[,"High_BP"],    "Sibling: BP Age Distribution", "Hypertension Age, years")
+f.hist.age(sibling[,"Urol_event"], "Sibling: Urological Event Distribution", "Age of the first urological event, years")
+
+f.hist.age(m.pop.rel[,"Age_0"],      "Relatives: Age at Time of Diagnosis of Index Cases Distribution", "Age of relatives, years")
+f.hist.age(m.pop.rel[,"High_BP"],    "Relatives: BP Age Distribution", "Hypertension Age, years")
+f.hist.age(m.pop.rel[,"Urol_event"], "Relatives: Urological Event Distribution", "Age of the first urological event, years")
+
+```
+
+## 1.2. Utilities
+
+Baseline utility values were assigned based on regression analysis using data from the Health Survey for England (HSE) 2018, with a linear model fitted to predict utilities by age and sex:  
+
+utility_model <- Param_sets[p.set, "u_intercept"] + 
+                 Param_sets[p.set, "u_age"] * m.pop.index[, "Age"] + 
+                 Param_sets[p.set, "u_sex"] * m.pop.index[, "Sex"]
+ 
+Residuals were added to the model to introduce random variability in individual values.
+
+The impact of disease severity was incorporated using utility multipliers calculated from the study by Perrone et al. (2023). This study is a prospective international investigation of a large population of ADPKD patients (*N* = 3,409), spanning a broad age range (12–78 years). It reports utilities across different CKD stages.
+
+Based on evidence from other CKD research (Jesky et al.), it was assumed that the utility multiplier for CKD stage 1 is **1**. Multipliers for subsequent stages were derived using the relative differences between stages reported by Perrone et al. (2023).
+
+For CKD stage 5, it was assumed that the utility values reported by Perrone et al. (2023) pertain to patients without kidney failure. This assumption was validated by the relatively high utility values compared to those reported in studies of patients with kidney failure, such as Lee et al. (2005). This study was used to derive utility multipliers for individuals with kidney failure.
+
+These utility multipliers were applied in the model to adjust for the reduced utilities of individuals with kidney failure by intervention type.
+
+## 1.3. Costs
+Costs by eGFR level were sampled from the UK based study of Pollok et al (2022)[https://doi.org/10.1093/ckj/sfac168]. The costs were inflated from 2020 to 2024 values. In the study, patients were not censored for transplant or dialysis initiation during the study period, but the specific costs for such procedures were not included in this analysis. Thus, additional costs of transplant and dialysis were added for such patients.
+
+It was assumed that the costs of support were already included in the annual costs reported by Pollok et all (2022) and so for patients with kidney transplant only the costs of transplant in the year of the procedure were included and the increased costs each following year.
+
+## 1.4.The PROPKD score
+The PROPKD score can be calculated for each individual based on their individual characteristics. The score was calculated assuming the following characteristics get additional points (https://adpkdsim.org/expert/prognostic-tools/propkd-score): 
+
+* Male - 1 point
+* Hypertension before 35 years of age - 2 points
+* First urologic event before 35 years of age - 2 points
+* Non-truncating PKD1 mutation - 2 points
+* Truncating PKD1 mutation - 4 points.
+
+## 2. Simulation 
+
+### 2.1. Simulating the natural history for index cases 
+ 
+The disease-related events for index cases are simulated using the script Run_index.R. The simulation begins by generating relevant matrices to store outputs. The primary matrix reporting the final results is Diag.out.
+
+#### 2.1.1. Model Structure
+
+The model is based on the principles of annual eGFR decline. Before running the simulation cycles, the annual eGFR decline for each patient is calculated, assuming a constant decline. 
+It is assumed that eGFR values can never reach zero or negative values. For patients experiencing rapid decline, their eGFR value is replaced with an arbitrary minimum of 0.1. This choice of minimum value does not impact the model results.
+
+The simulation operates in annual cycles, using two health states: Alive and Dead. 
+
+#### 2.1.2. Tolvaptan Eligibility Options
+
+Two eligibility options for tolvaptan treatment are incorporated into the model:
+
+Option 1: Tolvaptan is available for patients in CKD stages 2 and 3 with fast progression (more than 3ml/min a year decline), unless they have progressed to kidney transplant or discontinued tolvaptan.
+
+Option 2: Tolvaptan is available for patients who meet all of the following criteria: PROPKD score >= 6; eGFR ≥ 30; and eGFR annual decrease of >=3ml/min, - this means that the earliest that Tolvaptan can be prescribed is 1 year after the diagnosis because the trend in eGFR decline needs to be recorded. THe option2 is used in combination with OPTION 1. 
+
+**Tolvaptan stopping rule.** In the base case, patients who initiate tolvaptan remain on treatment until their eGFR falls to 15 ml/min/1.73m2 or below, they receive a kidney transplant, or they die. The CKD-stage and PROPKD criteria are treatment *initiation* criteria only; once initiated, treatment continues through CKD stage 4 (with the stage 3-4 treatment effect on eGFR decline applied) until the stopping rule fires. Patients who stop treatment do not restart.
+
+The stopping rule is controlled by its own flag, `Tolv_stop`, fully independent of the initiation criteria (`Tolv_elig`): `Tolv_stop = 1` (base case) stops treatment at eGFR <=15; `Tolv_stop = 2` applies only the previously used trial-based probabilistic annual discontinuation schedule (`Tolv_disc_Y1`-`Tolv_disc_Y4`, by age group and year on treatment, not linked to eGFR); `Tolv_stop = 3` applies **both** rules together. 
+
+#### 2.1.3. Disease progression and mortality
+According to Kerr (2012), having eGFR of <15 ml/min/1.73m2 is an established kidney failure. All patients reaching CKD stage 5 (who have eGFR < 7) require kidney replacement therapy. According to Kerr (2012), Chronic Kidney Disease in England: The Human and Financial Cost, 91% of UK patients receive either a kidney transplant or haemodialysis. Peritoneal dialysis, used by a small proportion of patients, was excluded from the model. Therefore, it is assumed that all patients in CKD stage 5 receive either kidney transplant, or haemodialysis.
+
+The mortality probability is assigned through the f.Prob function, based on the health state of each individual:
+
+* Patients in CKD stages 1-4: General sex- and age-dependent mortality rates.
+
+* Patients in CKD stage 5: Age-dependent mortality rates influenced by:
+
+** Eligibility for a kidney transplant and status on the transplant waiting list (if eligible).
+
+** Receipt of a kidney transplant.
+** Ineligibility for transplant, requiring dialysis.
+
+Eligibility for transplant is assigned randomly based on age-specific probabilities.
+
+
+```{r}
+
+# Run index cases in the no screening, opportunistic and organised screening scenarios.
+# The inputs that generate randomness within simulations are pre-determined (suppl_ind_func.R).
+
+source('R files/Run_index.R')
+source('R files/suppl_ind_func.R')
+
+
+# Decide on Tolvaptan prescription criteria: 
+# Criterion 1:  by CKD stage 2 or 3 (current guidelines) or
+# Criterion 2: Polycystic Kidney Disease (PROPKD) score >6 &
+#             Aged 18-55 years with an estimated glomerular filtration rate (eGFR) ≥25 ml/min/1.73 m2 
+
+# 0 - no screening, 1 -opportunistic screening; 2 - organised screening
+
+######################################################################
+if(run_mode != "PSA"){
+
+# no screening with Tv criteria 1
+ns_T1 <- f.run.index(m.pop.index= m.pop.index, a.Rand = a.Rand.i, t.transplant=t.transplant, i.eGFR.decl=i.eGFR.decl,
+                        Tolv_elig =1, 
+                        PKD_mutation_age_sex = PKD_mutation_age_sex, Param_sets =Param_sets, 
+                     p.Dial.Death = p.Dial.Death,
+                        t.horizon = t.horizon, m.Rand.ind =m.Rand.ind, p.set=1, 
+                     Screening.sc=0, Tolv_stop = Tolv_stop)
+
+
+# no screening with Tv criteria 2
+ns_T2 <- f.run.index(m.pop.index= m.pop.index, a.Rand = a.Rand.i, t.transplant=t.transplant, Tolv_elig =2, i.eGFR.decl=i.eGFR.decl,
+                        PKD_mutation_age_sex = PKD_mutation_age_sex, Param_sets =Param_sets, 
+                     p.Dial.Death = p.Dial.Death,
+                        t.horizon = t.horizon, m.Rand.ind =m.Rand.ind, p.set=1, 
+                     Screening.sc=0, Tolv_stop = Tolv_stop)
+
+# opportunistic screening with Tv criteria 1
+os_T1 <- f.run.index(m.pop.index= m.pop.index, a.Rand = a.Rand.i, t.transplant=t.transplant, Tolv_elig =1, i.eGFR.decl=i.eGFR.decl,
+                        PKD_mutation_age_sex = PKD_mutation_age_sex, Param_sets =Param_sets, 
+                     p.Dial.Death = p.Dial.Death,
+                        t.horizon = t.horizon, m.Rand.ind =m.Rand.ind, p.set=1, 
+                     Screening.sc=1, Tolv_stop = Tolv_stop)
+
+# opportunistic screening with Tv criteria 2
+os_T2 <- f.run.index(m.pop.index= m.pop.index, a.Rand = a.Rand.i, t.transplant=t.transplant, 
+                     Tolv_elig = 2, i.eGFR.decl=i.eGFR.decl,
+                        PKD_mutation_age_sex = PKD_mutation_age_sex, Param_sets =Param_sets, 
+                     p.Dial.Death = p.Dial.Death,
+                        t.horizon = t.horizon, m.Rand.ind =m.Rand.ind, p.set=1, 
+                     Screening.sc=1, Tolv_stop = Tolv_stop)
+
+
+# Organised screening with Tv criteria 1 (absolute uptake)
+orgs_T1 <- f.run.index(m.pop.index= m.pop.index, a.Rand = a.Rand.i, t.transplant=t.transplant, 
+                       Tolv_elig =1, i.eGFR.decl=i.eGFR.decl,
+                        PKD_mutation_age_sex = PKD_mutation_age_sex, Param_sets =Param_sets, 
+                       p.Dial.Death = p.Dial.Death,
+                        t.horizon = t.horizon, m.Rand.ind =m.Rand.ind, p.set=1, Screening.sc=2, Tolv_stop = Tolv_stop)
+
+
+# Organised screening with Tv criteria 2 (absolute uptake)
+orgs_T2 <- f.run.index(m.pop.index= m.pop.index, a.Rand = a.Rand.i, t.transplant=t.transplant, 
+                       Tolv_elig = 2, i.eGFR.decl=i.eGFR.decl,
+                        PKD_mutation_age_sex = PKD_mutation_age_sex, Param_sets =Param_sets, 
+                       p.Dial.Death = p.Dial.Death,
+                        t.horizon = t.horizon, m.Rand.ind =m.Rand.ind, p.set=1, 
+                       Screening.sc=2, Tolv_stop = Tolv_stop)
+
+
+# Process the outputs
+if(run_mode =="Deterministic"){
+  
+source("R files/Process_out/Process_DA.R")
+
+}
+
+if(run_mode =="Testing"){
+  
+# extract all matrices from the list of outputs
+source("R files/Process_out/Process_Testing.R")
+  
+  # All matrices are saved in the Global space including:
+  # m_eGFR - individual eGFR values (annual)
+  # m_CKD - individual CKD stages (annual)
+  # m_Diag - individual diagnostic outputs
+  # m.Out - all aggregated outputs includings costs and effect
+  # m_pop_index  - population that was evaluated
+  # m_M  -alive/dead states
+  # m_PROPKD - annual m.PROPKD score
+  
+  f.extract_matrices_to_global(ns_T1,"ns_T1")
+  f.extract_matrices_to_global(ns_T2,"ns_T2")
+  f.extract_matrices_to_global(os_T1,"os_T1")
+  f.extract_matrices_to_global(os_T2,"os_T2")
+  f.extract_matrices_to_global(orgs_T1,"orgs_T1")
+  f.extract_matrices_to_global(orgs_T2,"orgs_T2")
+
+}
+}
+
+```
+
+
+Reference:
+
+Chronic Kidney Disease in England: The Human and Financial Cost, Marion Kerr, Insight Health Economics.
+
+
+```{r}
+
+if(run_mode != "PSA"){
+  
+# Run relatives cases in no screening and screening scenario
+# To run relatives, index population need to run first and feed in to the population of relatives
+# So from each evaluated scenario, extract population of relatives first
+
+# Scenario with tolvaptan ==1 (only prescribed by CKD stage and not genetics)
+m.pop.index_ns_T1 <- ns_T1$m.pop.index
+m.pop.index_os_T1 <- os_T1$m.pop.index
+m.pop.index_orgs_T1 <- orgs_T1$m.pop.index
+
+# Scenario with tolvaptan ==2 (prescribed by CKD stage and genetics)
+m.pop.index_ns_T2 <- ns_T2$m.pop.index
+m.pop.index_os_T2 <- os_T2$m.pop.index
+m.pop.index_orgs_T2 <- orgs_T2$m.pop.index
+
+source('R files/suppl_rel_func.R')
+source('R files/suppl_US_func.R')
+source('R files/Run_relatives.R')
+
+
+# no screening with Tv criteria 1
+ns_T1_rel <- f.run.relative(m.pop =m.pop.rel, a.Rand = a.Rand.rel, t.transplant =t.transplant.rel, i.eGFR.decl=i.eGFR.decl.rel,
+                       Tolv_elig=1, PKD_mutation_age_sex, Param_sets, p.Dial.Death,
+                        t.horizon, m.Rand =m.Rand.rel, p.set=1, 
+                       m.pop.index = m.pop.index_ns_T1, Tolv_stop = Tolv_stop)
+
+
+# no screening with Tv criteria 2
+ns_T2_rel <- f.run.relative(m.pop =m.pop.rel, a.Rand = a.Rand.rel, 
+                            t.transplant =t.transplant.rel, i.eGFR.decl=i.eGFR.decl.rel,
+                       Tolv_elig=2, PKD_mutation_age_sex, Param_sets, p.Dial.Death,
+                        t.horizon, m.Rand =m.Rand.rel, p.set=1, 
+                       m.pop.index = m.pop.index_ns_T2, Tolv_stop = Tolv_stop)
+
+# opportunistic screening with Tv criteria 1
+os_T1_rel <- f.run.relative(m.pop =m.pop.rel, a.Rand = a.Rand.rel, 
+                            t.transplant =t.transplant.rel, i.eGFR.decl=i.eGFR.decl.rel,
+                       Tolv_elig=1, PKD_mutation_age_sex, Param_sets, p.Dial.Death,
+                        t.horizon, m.Rand =m.Rand.rel, p.set=1, 
+                       m.pop.index = m.pop.index_os_T1, Tolv_stop = Tolv_stop)
+
+# opportunistic screening with Tv criteria 2
+os_T2_rel <- f.run.relative(m.pop =m.pop.rel, a.Rand = a.Rand.rel, 
+                            t.transplant =t.transplant.rel, i.eGFR.decl=i.eGFR.decl.rel,
+                       Tolv_elig=2, PKD_mutation_age_sex, Param_sets, p.Dial.Death,
+                        t.horizon, m.Rand =m.Rand.rel, p.set=1, 
+                       m.pop.index = m.pop.index_os_T2, Tolv_stop = Tolv_stop)
+
+
+# Organised screening with Tv criteria 1 (absolute uptake)
+orgs_T1_rel <- f.run.relative(m.pop =m.pop.rel, a.Rand = a.Rand.rel, 
+                              t.transplant =t.transplant.rel, i.eGFR.decl=i.eGFR.decl.rel,
+                       Tolv_elig=1, PKD_mutation_age_sex, Param_sets, p.Dial.Death,
+                        t.horizon, m.Rand =m.Rand.rel, p.set=1, 
+                       m.pop.index = m.pop.index_orgs_T1, Tolv_stop = Tolv_stop)
+
+
+# Organised screening with Tv criteria 2 (absolute uptake)
+orgs_T2_rel <- f.run.relative(m.pop =m.pop.rel, a.Rand = a.Rand.rel, 
+                              t.transplant =t.transplant.rel, i.eGFR.decl=i.eGFR.decl.rel,
+                       Tolv_elig=2, PKD_mutation_age_sex, Param_sets, p.Dial.Death,
+                        t.horizon, m.Rand =m.Rand.rel, p.set=1, 
+                       m.pop.index = m.pop.index_orgs_T2, Tolv_stop = Tolv_stop)
+
+
+# Combined deterministic summary across BOTH populations:
+# lifetime tables (index / relatives / pooled), incremental CE and
+# NMB on the pooled values, relatives overdiagnosis, and plots. CSVs and PNGs
+# are written to Results/Deterministic/.
+if(run_mode =="Deterministic"){
+  source("R files/summary_outcomes.R")
+  source("R files/Process_out/Process_DA_combined.R")
+}
+
+if(run_mode =="Testing"){
+  
+# extract all matrices from the list of outputs
+source("R files/Process_out/Process_Testing.R")
+  
+  # All matrices are saved in the Global space including:
+  # m_eGFR - individual eGFR values (annual)
+  # m_CKD - individual CKD stages (annual)
+  # m_Diag - individual diagnostic outputs
+  # m.Out - all aggregated outputs includings costs and effect
+  # m_pop_index  - population that was evaluated
+  # m_M  -alive/dead states
+  # m_PROPKD - annual m.PROPKD score
+  
+  f.extract_matrices_to_global(ns_T1_rel,"rel_ns_T1")
+  f.extract_matrices_to_global(ns_T2_rel,"rel_ns_T2")
+  f.extract_matrices_to_global(os_T1_rel,"rel_os_T1")
+  f.extract_matrices_to_global(os_T2_rel,"rel_os_T2")
+  f.extract_matrices_to_global(orgs_T1_rel,"rel_orgs_T1")
+  f.extract_matrices_to_global(orgs_T2_rel,"rel_orgs_T2")
+
+}
+}
+  
+```
+# 3. Probabilistic sensitivity analysis
+
+The PSA uses `N.sets` parameter sets sampled from the distributions in `Parameters.txt`. To make sure that differences between PSA runs reflect parameter uncertainty only, the simulated population of index cases and relatives, together with all individual random numbers (mortality, tolvaptan discontinuation, transplant eligibility and timing, baseline eGFR decline), is generated **once** with the mean parameter values and reused in every PSA run. The tolvaptan treatment effect on eGFR decline is a PSA parameter, so the treated eGFR decline is recalculated for each parameter set from the same individual baseline decline.
+
+All parameter sets, the matching dialysis and mortality matrices, and the population are saved once to `Results/PSA/PSA_setup.rds`. Each PSA run *k* loads this file, takes parameter set *k*, runs the six scenarios for index cases and then for their relatives, and saves `Results/PSA/sets/PSA_set_000k.rds`. Because every run only reads the saved file, all runs are independent and are run in parallel on the HPC as one array job (`run_PSA.sh`), with array task *k* running parameter set *k*.
+
+The results of all runs are then combined (`R files/PSA_combine.R`) into mean costs, QALYs and life years with 95% credible intervals, incremental results versus no screening (`ns_T1`), a fully incremental analysis, probabilities of cost-effectiveness, cost-effectiveness planes, CEACs, the CEAF, EVPI and convergence plots, for index cases, relatives, and index cases with their relatives combined (per index case).
+
+Workflow:
+
+1. Run the chunk `psa_setup` below once (set `N.sets <- 1000` in the first chunk). This saves `Results/PSA/PSA_setup.rds`.
+2. Copy the project, including `Results/PSA/PSA_setup.rds`, to the HPC and submit `sbatch run_PSA.sh`.
+3. Copy `Results/PSA/sets/` back and run the chunk `psa_results`.
+
+```{r psa_setup, eval = (run_mode == "PSA")}
+# 1. Save all parameter sets and the population ONCE
+source("R files/PSA_setup.R")
+
+# Optional: test the first run locally before submitting to the HPC
+test_one_run <- TRUE
+if (test_one_run) {
+  PSA_local <- TRUE            # stops PSA_run.R from running a set automatically when sourced
+  source("R files/PSA_run.R")
+  f.run_psa_set(1, overwrite = TRUE)
+}
+```
+
+```{r psa_results, eval = (run_mode == "PSA" && dir.exists("Results/PSA/sets"))}
+# 3. After all HPC runs have finished: combine and summarise
+source("R files/PSA_combine.R")
+PSA_CE$pooled_per_index$table_formatted
+```

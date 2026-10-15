@@ -1,0 +1,15 @@
+# Not part of the public repository
+supplementary/
+
+# Model outputs
+Results/
+logs/
+*.rds
+ADPKD_report.docx
+ADPKD_report.pdf
+
+# R / RStudio
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
